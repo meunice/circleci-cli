@@ -10,11 +10,11 @@ import (
 	"regexp"
 	"syscall"
 
+	"github.com/CircleCI-Public/circleci-cli/api"
+	"github.com/CircleCI-Public/circleci-cli/client"
 	"github.com/CircleCI-Public/circleci-cli/settings"
-	"github.com/mitchellh/mapstructure"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
-	"gopkg.in/yaml.v2"
 )
 
 var picardRepo = "circleci/picard"
@@ -43,8 +43,6 @@ func UpdateBuildAgent() error {
 	return nil
 }
 
-// nolint: gocyclo
-// TODO(zzak): This function is fairly complex, we should refactor it
 func Execute(opts BuildOptions) error {
 	for _, f := range opts.Args {
 		if f == "--help" || f == "-h" {
@@ -52,8 +50,22 @@ func Execute(opts BuildOptions) error {
 		}
 	}
 
-	if err := validateConfigVersion(opts.Args); err != nil {
+	processedArgs, err := extractConfigPath(opts.Args)
+
+	if err != nil {
 		return err
+	}
+
+	cl := client.NewClient(opts.Cfg.Host, opts.Cfg.Endpoint, opts.Cfg.Token, opts.Cfg.Debug)
+
+	configResponse, err := api.ConfigQuery(cl, processedArgs.configPath)
+
+	if err != nil {
+		return err
+	}
+
+	if !configResponse.Valid {
+		return fmt.Errorf("config errors %v", configResponse.Errors)
 	}
 
 	pwd, err := os.Getwd()
@@ -66,25 +78,33 @@ func Execute(opts BuildOptions) error {
 		return err
 	}
 
+	f, err := ioutil.TempFile("/tmp", "*-config.yml")
+
+	if err != nil {
+		return errors.Wrap(err, "Error creating temporary config file")
+	}
+
+	if _, err = f.WriteString(configResponse.OutputYaml); err != nil {
+		return errors.Wrap(err, "Error writing processed config to temporary file")
+	}
+
 	image, err := picardImage()
 
 	if err != nil {
 		return errors.Wrap(err, "Could not find picard image")
 	}
 
-	// TODO: marc:
-	// We are passing the current environment to picard,
-	// so DOCKER_API_VERSION is only passed when it is set
-	// explicitly. The old bash script sets this to `1.23`
-	// when not explicitly set. Is this OK?
+	configPathInsideContainer := "/tmp/local_build_config.yml"
+
 	arguments := []string{"docker", "run", "--interactive", "--tty", "--rm",
 		"--volume", "/var/run/docker.sock:/var/run/docker.sock",
+		"--volume", fmt.Sprintf("%s:%s", f.Name(), configPathInsideContainer),
 		"--volume", fmt.Sprintf("%s:%s", pwd, pwd),
 		"--volume", fmt.Sprintf("%s:/root/.circleci", circleCiDir()),
 		"--workdir", pwd,
-		image, "circleci", "build"}
+		image, "circleci", "build", "--config", configPathInsideContainer}
 
-	arguments = append(arguments, opts.Args...)
+	arguments = append(arguments, processedArgs.args...)
 
 	if opts.Cfg.Debug {
 		_, err = fmt.Fprintf(os.Stderr, "Starting docker with args: %s", arguments)
@@ -103,53 +123,22 @@ func Execute(opts BuildOptions) error {
 	return errors.Wrap(err, "failed to execute docker")
 }
 
-func validateConfigVersion(args []string) error {
-	invalidConfigError := `
-You attempted to run a local build with version '%s' of configuration.
-Local builds do not support that version at this time.
-You can use 'circleci config process' to pre-process your config into a version that local builds can run (see 'circleci help config process' for more information)`
-	configFlags := pflag.NewFlagSet("configFlags", pflag.ContinueOnError)
-	configFlags.ParseErrorsWhitelist.UnknownFlags = true
-	var filename string
-
-	configFlags.StringVarP(&filename, "config", "c", DefaultConfigPath, "config file")
-
-	err := configFlags.Parse(args)
-	if err != nil {
-		return errors.New("Unable to parse flags")
-	}
-
-	// #nosec
-	configBytes, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return errors.Wrapf(err, "Unable to read config file")
-	}
-
-	version, isVersion := configVersion(configBytes)
-	if !isVersion || version == "" {
-		return errors.New("Unable to identify config version")
-	}
-
-	if version != "2.0" && version != "2" {
-		return fmt.Errorf(invalidConfigError, version)
-	}
-
-	return nil
+type processedArgs struct {
+	args       []string
+	configPath string
 }
 
-func configVersion(configBytes []byte) (string, bool) {
-	var raw map[string]interface{}
-	if err := yaml.Unmarshal(configBytes, &raw); err != nil {
-		return "", false
+func extractConfigPath(args []string) (*processedArgs, error) {
+	flagSet := pflag.NewFlagSet("mock", pflag.ContinueOnError)
+	var configFilename string
+	flagSet.StringVarP(&configFilename, "config", "c", DefaultConfigPath, "config file")
+	if err := flagSet.Parse(args); err != nil {
+		return nil, err
 	}
-
-	var configWithVersion struct {
-		Version string `yaml:"version"`
-	}
-	if err := mapstructure.WeakDecode(raw, &configWithVersion); err != nil {
-		return "", false
-	}
-	return configWithVersion.Version, true
+	return &processedArgs{
+		configPath: configFilename,
+		args:       flagSet.Args(),
+	}, nil
 }
 
 func picardImage() (string, error) {
